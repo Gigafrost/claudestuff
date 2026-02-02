@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Tagged.com Pet Sniper (Safe Mode)
 // @namespace    http://tampermonkey.net/
-// @version      3.0
-// @description  Auto-buys pets (new & old). UI: Top-Right with session counter & live cooldown timer. Logic: 1% Financial Rule. Excludes Lock button. Persistent Batch Counts.
+// @version      3.1
+// @description  Auto-buys pets (old first, then new). Activity log UI with session counter, batch progress bar, and live cooldown timer. 1% Financial Rule. Persistent state.
 // @author       Gemini
 // @match        *://*.tagged.com/*
 // @grant        none
@@ -13,19 +13,15 @@
 
     // --- Configuration ---
     const CONFIG = {
-        // Random delay between standard purchases (2.42s - 5.7s)
         minDelay: 2420,
         maxDelay: 5700,
 
-        // Batching Logic: Pause after buying X pets
         batchSizeMin: 10,
         batchSizeMax: 12,
 
-        // Duration of the "long pause" between batches (15s - 20s)
         batchCooldownMin: 15000,
         batchCooldownMax: 20000,
 
-        // The safety text we MUST see before buying to consider it "Free"
         safePriceRegex: /Less than \$0\.01/i,
 
         patterns: {
@@ -38,7 +34,6 @@
             refreshErrorMsg: /An error occur+ed.*?refresh/i
         },
         selectors: {
-            // EXCLUDE the lock button so we don't try to "buy" it
             potentialButtons: [
                 'input[type="button"]:not(.id-button-lockpet)',
                 'button:not(.id-button-lockpet)',
@@ -52,10 +47,10 @@
                 '.btn-buy'
             ].join(', '),
             ignoreBtn: '.id-button-ignore, .btn-ignore',
-            // Close buttons priority
             closeBtns: '.lock-pet-close, .buy-pet-complete .id-button-continue, .tag-link-close, .id-button-close'
         },
-        debug: true
+        debug: true,
+        maxLogEntries: 20
     };
 
     // --- State Variables (with Persistence) ---
@@ -64,7 +59,6 @@
     let scanInterval = null;
     let pendingIgnoreBtn = null;
 
-    // Load state from storage or default
     let consecutivePurchases = parseInt(sessionStorage.getItem('petBot_count')) || 0;
     let currentBatchLimit = parseInt(sessionStorage.getItem('petBot_limit')) || 10;
     let totalSessionPurchases = parseInt(sessionStorage.getItem('petBot_total')) || 0;
@@ -72,6 +66,9 @@
     // Cooldown timer state
     let cooldownTimerId = null;
     let cooldownEndTime = 0;
+
+    // Activity log
+    let activityLog = JSON.parse(sessionStorage.getItem('petBot_log') || '[]');
 
     // --- GUI Management ---
     function createControls() {
@@ -81,85 +78,158 @@
         const div = document.createElement('div');
         div.id = 'petbot-controls';
         Object.assign(div.style, {
-            position: 'fixed', top: '20px', right: '20px', zIndex: '2147483647',
-            backgroundColor: '#111', color: '#fff', padding: '15px',
-            borderRadius: '8px', fontFamily: 'Arial, sans-serif',
-            boxShadow: '0 4px 20px rgba(0,0,0,0.6)', minWidth: '200px',
-            border: '1px solid #333'
+            position: 'fixed', top: '15px', right: '15px', zIndex: '2147483647',
+            backgroundColor: '#111', color: '#fff', padding: '0',
+            borderRadius: '10px', fontFamily: "'Segoe UI', Arial, sans-serif",
+            boxShadow: '0 4px 24px rgba(0,0,0,0.7)', width: '260px',
+            border: '1px solid #333', overflow: 'hidden'
         });
 
         div.innerHTML = `
-            <div style="font-weight:bold; color:#4caf50; margin-bottom:10px; border-bottom:1px solid #333; padding-bottom:5px;">
-                Pet Sniper v3.0
+            <div style="background:#1a1a1a; padding:10px 14px; border-bottom:1px solid #333; display:flex; justify-content:space-between; align-items:center;">
+                <span style="font-weight:bold; color:#4caf50; font-size:13px;">Pet Sniper v3.1</span>
+                <span id="petbot-state" style="font-size:11px; padding:2px 8px; border-radius:10px; font-weight:bold; background:#333; color:#888;">STOPPED</span>
             </div>
-            <div id="petbot-status" style="font-size:13px; margin-bottom:8px; color:#aaa; font-weight:bold;">Stopped</div>
-            <div id="petbot-total" style="font-size:12px; margin-bottom:4px; color:#4caf50; font-weight:bold;">Session: 0 pets bought</div>
-            <div id="petbot-stats" style="font-size:11px; margin-bottom:4px; color:#888;">Batch: ${consecutivePurchases}/${currentBatchLimit}</div>
-            <div id="petbot-cooldown" style="font-size:12px; margin-bottom:10px; color:#3498db; font-weight:bold; min-height:16px;"></div>
-            <button id="petbot-start" style="width:100%; padding:8px; background:#28a745; color:white; border:none; border-radius:4px; font-weight:bold; cursor:pointer;">START (Alt+S)</button>
-            <button id="petbot-stop" style="width:100%; padding:8px; background:#d32f2f; color:white; border:none; border-radius:4px; font-weight:bold; cursor:pointer; display:none;">STOP (Esc)</button>
+
+            <div style="padding:10px 14px 6px;">
+                <div style="display:flex; justify-content:space-between; align-items:baseline; margin-bottom:6px;">
+                    <span style="font-size:11px; color:#888;">Session Purchases</span>
+                    <span id="petbot-total" style="font-size:18px; font-weight:bold; color:#4caf50;">0</span>
+                </div>
+
+                <div style="margin-bottom:8px;">
+                    <div style="display:flex; justify-content:space-between; font-size:10px; color:#666; margin-bottom:3px;">
+                        <span>Batch Progress</span>
+                        <span id="petbot-batch-text">0 / 10</span>
+                    </div>
+                    <div style="background:#222; border-radius:4px; height:8px; overflow:hidden;">
+                        <div id="petbot-batch-bar" style="background:linear-gradient(90deg,#4caf50,#81c784); height:100%; width:0%; border-radius:4px; transition:width 0.3s ease;"></div>
+                    </div>
+                </div>
+
+                <div id="petbot-cooldown-wrap" style="display:none; margin-bottom:8px; padding:6px 8px; background:#0d253d; border:1px solid #1a4a7a; border-radius:6px;">
+                    <div style="display:flex; justify-content:space-between; align-items:center;">
+                        <span style="font-size:11px; color:#5dade2;">Cooldown</span>
+                        <span id="petbot-cooldown-time" style="font-size:14px; font-weight:bold; color:#5dade2; font-family:monospace;">--</span>
+                    </div>
+                    <div style="background:#1a3a5c; border-radius:3px; height:4px; overflow:hidden; margin-top:4px;">
+                        <div id="petbot-cooldown-bar" style="background:#3498db; height:100%; width:100%; border-radius:3px; transition:width 0.5s linear;"></div>
+                    </div>
+                </div>
+            </div>
+
+            <div style="padding:0 14px;">
+                <div style="font-size:10px; color:#555; text-transform:uppercase; letter-spacing:1px; margin-bottom:4px;">Activity Log</div>
+                <div id="petbot-log" style="max-height:160px; overflow-y:auto; background:#0a0a0a; border-radius:6px; padding:4px 0; font-family:'Consolas','Courier New',monospace; font-size:11px; border:1px solid #222;"></div>
+            </div>
+
+            <div style="padding:10px 14px;">
+                <button id="petbot-start" style="width:100%; padding:8px; background:#28a745; color:white; border:none; border-radius:6px; font-weight:bold; cursor:pointer; font-size:12px;">START (Alt+S)</button>
+                <button id="petbot-stop" style="width:100%; padding:8px; background:#d32f2f; color:white; border:none; border-radius:6px; font-weight:bold; cursor:pointer; font-size:12px; display:none;">STOP (Esc)</button>
+            </div>
         `;
 
         document.body.appendChild(div);
         document.getElementById('petbot-start').onclick = () => triggerStart(true);
         document.getElementById('petbot-stop').onclick = () => triggerStop(true);
 
-        // Restore total display on load
+        // Render persisted state
         updateStats();
+        renderLog();
     }
 
-    function updateStatus(text, color = '#aaa') {
-        const el = document.getElementById('petbot-status');
-        if (el) {
-            el.innerText = text;
-            el.style.color = color;
+    // --- Activity Log ---
+    function logActivity(text, color = '#aaa') {
+        const now = new Date();
+        const time = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+        activityLog.push({ time, text, color });
+        if (activityLog.length > CONFIG.maxLogEntries) {
+            activityLog = activityLog.slice(-CONFIG.maxLogEntries);
         }
+        // Persist log
+        try { sessionStorage.setItem('petBot_log', JSON.stringify(activityLog)); } catch(e) {}
+        renderLog();
+        if (CONFIG.debug) console.log(`[PetBot] ${text}`);
     }
 
+    function renderLog() {
+        const el = document.getElementById('petbot-log');
+        if (!el) return;
+        el.innerHTML = activityLog.map(entry =>
+            `<div style="color:${entry.color}; padding:2px 8px; border-bottom:1px solid #151515; line-height:1.4;">` +
+            `<span style="color:#444; margin-right:6px;">${entry.time}</span>${entry.text}</div>`
+        ).join('');
+        el.scrollTop = el.scrollHeight;
+    }
+
+    // --- Stats & Cooldown Display ---
     function updateStats() {
-        // Save to storage every time we update
         sessionStorage.setItem('petBot_count', consecutivePurchases);
         sessionStorage.setItem('petBot_limit', currentBatchLimit);
         sessionStorage.setItem('petBot_total', totalSessionPurchases);
 
-        const statsEl = document.getElementById('petbot-stats');
-        if (statsEl) {
-            statsEl.innerText = `Batch: ${consecutivePurchases}/${currentBatchLimit}`;
-        }
-
         const totalEl = document.getElementById('petbot-total');
-        if (totalEl) {
-            totalEl.innerText = `Session: ${totalSessionPurchases} pet${totalSessionPurchases !== 1 ? 's' : ''} bought`;
+        if (totalEl) totalEl.innerText = totalSessionPurchases;
+
+        const batchText = document.getElementById('petbot-batch-text');
+        if (batchText) batchText.innerText = `${consecutivePurchases} / ${currentBatchLimit}`;
+
+        const batchBar = document.getElementById('petbot-batch-bar');
+        if (batchBar) {
+            const pct = currentBatchLimit > 0 ? Math.min(100, (consecutivePurchases / currentBatchLimit) * 100) : 0;
+            batchBar.style.width = pct + '%';
+            // Color shift as batch fills up
+            if (pct >= 80) batchBar.style.background = 'linear-gradient(90deg,#ff9800,#ffb74d)';
+            else batchBar.style.background = 'linear-gradient(90deg,#4caf50,#81c784)';
         }
     }
 
-    function updateCooldownDisplay(text) {
-        const el = document.getElementById('petbot-cooldown');
+    function setStateIndicator(text, bgColor, textColor) {
+        const el = document.getElementById('petbot-state');
         if (el) {
             el.innerText = text;
+            el.style.background = bgColor;
+            el.style.color = textColor;
         }
     }
+
+    let cooldownDuration = 0;
 
     function startCooldownTimer(durationMs) {
         cooldownEndTime = Date.now() + durationMs;
+        cooldownDuration = durationMs;
         clearInterval(cooldownTimerId);
+
+        const wrap = document.getElementById('petbot-cooldown-wrap');
+        if (wrap) wrap.style.display = 'block';
+
+        setStateIndicator('COOLDOWN', '#0d253d', '#5dade2');
+
         cooldownTimerId = setInterval(() => {
             const remaining = Math.max(0, cooldownEndTime - Date.now());
             if (remaining <= 0) {
                 clearInterval(cooldownTimerId);
                 cooldownTimerId = null;
-                updateCooldownDisplay('');
+                const w = document.getElementById('petbot-cooldown-wrap');
+                if (w) w.style.display = 'none';
                 return;
             }
             const secs = Math.ceil(remaining / 1000);
-            updateCooldownDisplay(`Cooldown: ${secs}s remaining`);
+            const timeEl = document.getElementById('petbot-cooldown-time');
+            if (timeEl) timeEl.innerText = secs + 's';
+
+            const bar = document.getElementById('petbot-cooldown-bar');
+            if (bar && cooldownDuration > 0) {
+                bar.style.width = ((remaining / cooldownDuration) * 100) + '%';
+            }
         }, 500);
     }
 
     function stopCooldownTimer() {
         clearInterval(cooldownTimerId);
         cooldownTimerId = null;
-        updateCooldownDisplay('');
+        const wrap = document.getElementById('petbot-cooldown-wrap');
+        if (wrap) wrap.style.display = 'none';
     }
 
     function toggleGui(running) {
@@ -169,8 +239,12 @@
             start.style.display = running ? 'none' : 'block';
             stop.style.display = running ? 'block' : 'none';
         }
-        updateStatus(running ? "Scanning..." : "Stopped", running ? '#4caf50' : '#aaa');
-        if (!running) stopCooldownTimer();
+        if (running) {
+            setStateIndicator('RUNNING', '#1b3a1b', '#4caf50');
+        } else {
+            setStateIndicator('STOPPED', '#333', '#888');
+            stopCooldownTimer();
+        }
         if (running) updateStats();
     }
 
@@ -213,8 +287,6 @@
 
     function safeClick(element) {
         if (!element) return;
-        const prefix = window.top !== window.self ? "[PetBot-Frame]" : "[PetBot-Top]";
-
         try { element.scrollIntoView({block: "center", inline: "center"}); } catch(e){}
 
         const eventTypes = ['mouseover', 'mousedown', 'mouseup', 'click', 'pointerdown', 'pointerup'];
@@ -242,6 +314,17 @@
     const sleep = (ms) => new Promise(r => setTimeout(r, ms));
     const randomDelay = (min = CONFIG.minDelay, max = CONFIG.maxDelay) => Math.floor(Math.random() * (max - min + 1) + min);
 
+    // --- Helper: Close any visible modal ---
+    function closeAnyModal() {
+        const btns = document.querySelectorAll(CONFIG.selectors.closeBtns);
+        const closeBtn = Array.from(btns).find(isVisible);
+        if (closeBtn) {
+            safeClick(closeBtn);
+            return true;
+        }
+        return false;
+    }
+
     // --- Helper: Ghost Pet Detector ---
     function isGhostPet(btn) {
         if (btn.closest('.ghost-pet')) return true;
@@ -258,13 +341,11 @@
 
     // --- Helper: New Pet Safety Check ---
     function isNewPetSafe(btn) {
-        // Traverse up to find the pet card container
         let container = btn.closest('.buy-three-friends')
             || btn.closest('[class*="id-friends-pet"]')
             || btn.closest('.pet-list-row');
 
         if (!container) {
-            // Fallback: walk up until we find a container with .id-value
             container = btn.parentElement;
             for (let i = 0; i < 6 && container; i++) {
                 if (container.querySelector('.id-value')) break;
@@ -294,19 +375,6 @@
         return false;
     }
 
-    // --- Helper: Success Detection ---
-    function isPurchaseSuccess() {
-        // Look specifically for the div structure the user provided
-        const successModal = document.querySelector('.buy-pet-complete');
-        const container = document.querySelector('.id-container-confirm');
-
-        // It must be visible to count
-        if (successModal && isVisible(successModal)) return true;
-        if (container && isVisible(container) && container.innerText.includes("Purchase Complete")) return true;
-
-        return false;
-    }
-
     // --- Helper: Text Detection ---
     function hasText(regex) {
         const overlay = document.querySelector('.tag-overlay-body');
@@ -328,75 +396,90 @@
         return false;
     }
 
+    // --- Post-Purchase Handler ---
+    // Called after clicking "Buy Now" (validated). Counts the purchase,
+    // closes modals, and handles batch cooldown/delay.
+    async function handlePostPurchase(type) {
+        isProcessing = true;
+
+        // Wait for the site to process the purchase
+        await sleep(1500);
+
+        // Check if an error appeared instead of success
+        if (hasText(CONFIG.patterns.buyGoldMsg) || hasText(CONFIG.patterns.refreshErrorMsg)) {
+            logActivity('Purchase failed (error detected)', '#ff5252');
+            closeAnyModal();
+            await sleep(500);
+            isProcessing = false;
+            return;
+        }
+
+        // No error — count as purchased
+        consecutivePurchases++;
+        totalSessionPurchases++;
+        logActivity(`Bought pet #${totalSessionPurchases} (${type})`, '#4caf50');
+        updateStats();
+
+        // Try to close success modal
+        closeAnyModal();
+
+        // Batch logic
+        if (consecutivePurchases >= currentBatchLimit) {
+            const batchWait = randomDelay(CONFIG.batchCooldownMin, CONFIG.batchCooldownMax);
+            logActivity(`Batch of ${currentBatchLimit} done! Cooling down ${Math.round(batchWait/1000)}s`, '#3498db');
+
+            startCooldownTimer(batchWait);
+
+            consecutivePurchases = 0;
+            currentBatchLimit = randomDelay(CONFIG.batchSizeMin, CONFIG.batchSizeMax);
+            updateStats();
+
+            await sleep(batchWait);
+            stopCooldownTimer();
+            setStateIndicator('RUNNING', '#1b3a1b', '#4caf50');
+            logActivity('Cooldown over, resuming...', '#4caf50');
+        } else {
+            const wait = randomDelay();
+            logActivity(`Waiting ${(wait/1000).toFixed(1)}s...`, '#666');
+            await sleep(wait);
+        }
+
+        isProcessing = false;
+    }
+
     // --- Core Logic ---
 
     async function scanRoutine() {
         if (!isRunning || isProcessing) return;
 
-        // 1. GLOBAL: Error Handling
+        // 1. Error Handling
         if (hasText(CONFIG.patterns.refreshErrorMsg)) {
-            updateStatus("Error! Refreshing...", "#ff5252");
-            console.log("[PetBot] Refresh Error. Reloading...");
+            logActivity('Error detected! Refreshing page...', '#ff5252');
             isProcessing = true;
             await sleep(2000);
             location.reload();
             return;
         }
 
-        // 2. GLOBAL: Unaffordable
+        // 2. Unaffordable
         if (hasText(CONFIG.patterns.buyGoldMsg)) {
             handleExpensivePet("Buy Gold Msg");
             return;
         }
 
-        // 3. GLOBAL: Success Handling (Using specific detection)
-        if (isPurchaseSuccess()) {
-            updateStatus("Bought! Closing...", "#4caf50");
-            pendingIgnoreBtn = null;
-
-            // Close Logic
-            let xBtn = document.querySelector('.lock-pet-close');
-            if (!xBtn || !isVisible(xBtn)) xBtn = document.querySelector('.buy-pet-complete .id-button-continue');
-            if (!xBtn || !isVisible(xBtn)) {
-                const xBtns = document.querySelectorAll(CONFIG.selectors.closeBtns);
-                xBtn = Array.from(xBtns).find(isVisible);
-            }
-
-            if (xBtn) {
-                safeClick(xBtn);
-            } else {
-                switchPetBackground();
-            }
-
-            // --- BATCH LOGIC ---
+        // 3. Close stale success modals (don't count — just clear them)
+        const successModal = document.querySelector('.buy-pet-complete');
+        if (successModal && isVisible(successModal)) {
+            closeAnyModal();
             isProcessing = true;
-            consecutivePurchases++;
-            totalSessionPurchases++;
-            console.log(`[PetBot] Purchase confirmed! Session total: ${totalSessionPurchases}. Batch: ${consecutivePurchases}/${currentBatchLimit}`);
-
-            if (consecutivePurchases >= currentBatchLimit) {
-                const batchWait = randomDelay(CONFIG.batchCooldownMin, CONFIG.batchCooldownMax);
-                updateStatus(`Batch done! Cooling down...`, "#3498db");
-
-                // Start live cooldown timer
-                startCooldownTimer(batchWait);
-
-                // Reset stats for next batch
-                consecutivePurchases = 0;
-                currentBatchLimit = randomDelay(CONFIG.batchSizeMin, CONFIG.batchSizeMax);
-                updateStats(); // Save reset state
-
-                await sleep(batchWait);
-                stopCooldownTimer();
-            } else {
-                const wait = randomDelay();
-                updateStats(); // Save incremented state
-                updateStatus(`Waiting ${Math.round(wait/1000)}s...`, "#999");
-                await sleep(wait);
-            }
-
-            isProcessing = false;
-            updateStatus("Scanning...", "#4caf50");
+            setTimeout(() => isProcessing = false, 800);
+            return;
+        }
+        const confirmBox = document.querySelector('.id-container-confirm');
+        if (confirmBox && isVisible(confirmBox) && confirmBox.innerText.includes("Purchase Complete")) {
+            closeAnyModal();
+            isProcessing = true;
+            setTimeout(() => isProcessing = false, 800);
             return;
         }
 
@@ -426,8 +509,10 @@
 
         // 5a. Handle confirmation modals first (Get New Price / Buy Now)
         if (newPriceBtn && !newPriceBtn.disabled) {
-            updateStatus("Updating Price...", "#ff9800");
+            logActivity('Updating price...', '#ff9800');
             safeClick(newPriceBtn);
+            isProcessing = true;
+            setTimeout(() => isProcessing = false, 1200);
             return;
         }
 
@@ -436,27 +521,29 @@
 
             // A. Free?
             if (isFreePet(modal)) {
-                updateStatus("Buying (Free)...", "#00e676");
+                logActivity('Confirming purchase (Free)...', '#00e676');
                 safeClick(buyNowBtn);
+                await handlePostPurchase('Free');
                 return;
             }
 
-            // B. Affordable?
+            // B. Affordable? (1% rule)
             let isAffordable = false;
             if (modal) {
                 const startVal = parseBigCash(modal, '.confirm-list li:first-child .confirm-cash');
                 const endVal = parseBigCash(modal, '.confirm-list li.ending-cash .confirm-cash');
 
                 if (startVal !== null && endVal !== null) {
-                    const threshold = (startVal * 99n) / 100n; // 99% Rule
+                    const threshold = (startVal * 99n) / 100n;
                     if (endVal >= threshold) isAffordable = true;
                     else console.log(`[PetBot] DENIED. Start: ${startVal}, End: ${endVal}`);
                 }
             }
 
             if (isAffordable) {
-                updateStatus("Buying (Safe)...", "#00e676");
+                logActivity('Confirming purchase (Safe)...', '#00e676');
                 safeClick(buyNowBtn);
+                await handlePostPurchase('Safe');
                 return;
             } else {
                 handleExpensivePet("Expensive", allBuyBacks);
@@ -464,56 +551,20 @@
             }
         }
 
-        // 5b. Pet list triggers (open confirmation dialogs)
+        // 5b. Pet list triggers — OLD PETS FIRST, then new pets
 
-        // NEW PETS: "Buy!" button on the pet list
-        if (buyNewBtn && !buyNewBtn.disabled) {
-            if (isGhostPet(buyNewBtn)) {
-                updateStatus("Ignoring Ghost...", "#ffa500");
-                console.log("[PetBot] Ghost Pet detected (new). Ignoring.");
-                const ignore = findIgnoreButton(buyNewBtn);
-                if (ignore) safeClick(ignore);
-
-                isProcessing = true;
-                setTimeout(() => isProcessing = false, 1200);
-                return;
-            }
-
-            // Check if the pet's listed value is safe before clicking
-            if (isNewPetSafe(buyNewBtn)) {
-                updateStatus("Buying New Pet...", "#2196f3");
-                pendingIgnoreBtn = findIgnoreButton(buyNewBtn);
-                safeClick(buyNewBtn);
-                isProcessing = true;
-                setTimeout(() => isProcessing = false, 1200);
-                return;
-            } else {
-                // Value too high or unreadable — skip this pet
-                updateStatus("New pet too expensive, ignoring...", "#ffa500");
-                console.log("[PetBot] New pet failed safety check. Ignoring.");
-                const ignore = findIgnoreButton(buyNewBtn);
-                if (ignore) safeClick(ignore);
-
-                isProcessing = true;
-                setTimeout(() => isProcessing = false, 1200);
-                return;
-            }
-        }
-
-        // OLD PETS: "Buy Back" button
+        // "Buy Back" (previously owned pets — PRIORITY)
         if (buyBackBtn && !buyBackBtn.disabled) {
             if (isGhostPet(buyBackBtn)) {
-                 updateStatus("Ignoring Ghost...", "#ffa500");
-                 console.log("[PetBot] Ghost Pet detected. Ignoring.");
-                 const ignore = findIgnoreButton(buyBackBtn);
-                 if(ignore) safeClick(ignore);
-
-                 isProcessing = true;
-                 setTimeout(() => isProcessing = false, 1200);
-                 return;
+                logActivity('Skipping ghost pet', '#ffa500');
+                const ignore = findIgnoreButton(buyBackBtn);
+                if (ignore) safeClick(ignore);
+                isProcessing = true;
+                setTimeout(() => isProcessing = false, 1200);
+                return;
             }
 
-            updateStatus("Clicking Buy Back...", "#2196f3");
+            logActivity('Clicking Buy Back...', '#2196f3');
             pendingIgnoreBtn = findIgnoreButton(buyBackBtn);
             safeClick(buyBackBtn);
             isProcessing = true;
@@ -521,30 +572,54 @@
             return;
         }
 
-        // "Buy Again" button
+        // "Buy Again"
         if (buyAgainBtn) {
-             updateStatus("Clicking Buy Again...", "#2196f3");
-             pendingIgnoreBtn = null;
-             safeClick(buyAgainBtn);
-             isProcessing = true;
-             setTimeout(() => isProcessing = false, 1200);
-             return;
+            logActivity('Clicking Buy Again...', '#2196f3');
+            pendingIgnoreBtn = null;
+            safeClick(buyAgainBtn);
+            isProcessing = true;
+            setTimeout(() => isProcessing = false, 1200);
+            return;
+        }
+
+        // "Buy!" (new pets — only when no Buy Back available)
+        if (buyNewBtn && !buyNewBtn.disabled) {
+            if (isGhostPet(buyNewBtn)) {
+                logActivity('Skipping ghost pet (new)', '#ffa500');
+                const ignore = findIgnoreButton(buyNewBtn);
+                if (ignore) safeClick(ignore);
+                isProcessing = true;
+                setTimeout(() => isProcessing = false, 1200);
+                return;
+            }
+
+            if (isNewPetSafe(buyNewBtn)) {
+                logActivity('Clicking Buy! (new pet)...', '#9c27b0');
+                pendingIgnoreBtn = findIgnoreButton(buyNewBtn);
+                safeClick(buyNewBtn);
+                isProcessing = true;
+                setTimeout(() => isProcessing = false, 1200);
+                return;
+            } else {
+                logActivity('New pet too expensive, skipping', '#ffa500');
+                const ignore = findIgnoreButton(buyNewBtn);
+                if (ignore) safeClick(ignore);
+                isProcessing = true;
+                setTimeout(() => isProcessing = false, 1200);
+                return;
+            }
         }
     }
 
     // --- Helper: Escape/Ignore Expensive ---
     async function handleExpensivePet(reason, availableBuyBacks = []) {
-        updateStatus("Too Expensive!", "#ff5252");
+        logActivity('Too expensive! Skipping...', '#ff5252');
         isProcessing = true;
 
-        const closeBtn = Array.from(document.querySelectorAll(CONFIG.selectors.closeBtns)).find(isVisible);
-        if (closeBtn) {
-            safeClick(closeBtn);
-        } else {
-            // Escape Hatch logic
+        if (!closeAnyModal()) {
             if (availableBuyBacks.length === 0) {
-                 const allBtns = Array.from(document.querySelectorAll(CONFIG.selectors.potentialButtons));
-                 availableBuyBacks = allBtns.filter(b => CONFIG.patterns.buyBack.test(b.value || b.innerText));
+                const allBtns = Array.from(document.querySelectorAll(CONFIG.selectors.potentialButtons));
+                availableBuyBacks = allBtns.filter(b => CONFIG.patterns.buyBack.test(b.value || b.innerText));
             }
 
             if (availableBuyBacks.length > 1 && isVisible(availableBuyBacks[1])) {
@@ -555,7 +630,7 @@
                 pendingIgnoreBtn = nextIgnore;
 
                 setTimeout(() => {
-                     if (oldIgnore) safeClick(oldIgnore);
+                    if (oldIgnore) safeClick(oldIgnore);
                 }, 800);
 
                 setTimeout(() => isProcessing = false, 1500);
@@ -565,16 +640,16 @@
 
         await sleep(600);
         if (pendingIgnoreBtn && document.body.contains(pendingIgnoreBtn)) {
-             safeClick(pendingIgnoreBtn);
+            safeClick(pendingIgnoreBtn);
         }
         pendingIgnoreBtn = null;
         isProcessing = false;
     }
 
     function switchPetBackground() {
-         const allBtns = Array.from(document.querySelectorAll(CONFIG.selectors.potentialButtons));
-         const backs = allBtns.filter(b => isVisible(b) && CONFIG.patterns.buyBack.test(b.value || b.innerText));
-         if(backs.length > 1) safeClick(backs[1]);
+        const allBtns = Array.from(document.querySelectorAll(CONFIG.selectors.potentialButtons));
+        const backs = allBtns.filter(b => isVisible(b) && CONFIG.patterns.buyBack.test(b.value || b.innerText));
+        if (backs.length > 1) safeClick(backs[1]);
     }
 
     // --- Init ---
@@ -584,11 +659,10 @@
         isProcessing = false;
         pendingIgnoreBtn = null;
 
-        // Restore or Init
         if (currentBatchLimit < 10) currentBatchLimit = randomDelay(CONFIG.batchSizeMin, CONFIG.batchSizeMax);
 
         toggleGui(true);
-        console.log(`[PetBot] Bot Started. Session total: ${totalSessionPurchases}. Batch: ${consecutivePurchases}/${currentBatchLimit}`);
+        logActivity('Bot started', '#4caf50');
         scanInterval = setInterval(scanRoutine, 250);
     }
 
@@ -598,7 +672,7 @@
         clearInterval(scanInterval);
         stopCooldownTimer();
         toggleGui(false);
-        console.log("[PetBot] Bot Stopped");
+        logActivity('Bot stopped', '#888');
     }
 
     if (document.readyState === 'loading') {
